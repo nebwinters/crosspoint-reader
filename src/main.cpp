@@ -17,6 +17,7 @@
 #include <builtinFonts/all.h>
 
 #include <cstring>
+#include <string>
 
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
@@ -25,6 +26,8 @@
 #include "OpdsServerStore.h"
 #include "RecentBooksStore.h"
 #include "SdCardFontSystem.h"
+#include "WifiCredentialStore.h"
+#include "network/HttpDownloader.h"
 #include "activities/Activity.h"
 #include "activities/ActivityManager.h"
 #include "activities/settings/SdFirmwareUpdateActivity.h"
@@ -234,8 +237,80 @@ static bool loadSleepFrameBuffer() {
 }
 
 // Enter deep sleep mode
+// ── Dashboard auto-sync ──────────────────────────────────────────────────────
+// Optional: if the SD card root holds a "/dashboard.url" file containing a single
+// http(s) URL, briefly bring up WiFi (last saved network), download that URL into
+// /sleep.bmp, switch the sleep screen to CUSTOM, then tear WiFi back down. The
+// file's presence is the on/off switch, and editing it re-points the source with
+// no firmware rebuild. Invoked at sleep entry so the freshly fetched image is what
+// the sleep screen renders this sleep.
+static bool readDashboardUrl(std::string& out) {
+  if (!Storage.exists("/dashboard.url")) return false;
+  HalFile f;
+  if (!Storage.openFileForRead("SYNC", "/dashboard.url", f)) return false;
+  char buf[192] = {0};
+  const int n = f.read(buf, sizeof(buf) - 1);  // f auto-closes at scope exit
+  if (n <= 0) return false;
+  out.assign(buf, n);
+  const size_t start = out.find_first_not_of(" \t\r\n");
+  const size_t end = out.find_last_not_of(" \t\r\n");
+  if (start == std::string::npos) return false;
+  out = out.substr(start, end - start + 1);
+  return out.rfind("http", 0) == 0;  // sanity: must look like a URL
+}
+
+static void syncSleepImageFromUrl() {
+  std::string url;
+  if (!readDashboardUrl(url)) return;  // feature disabled (no /dashboard.url)
+
+  WIFI_STORE.loadFromFile();
+  const std::string& ssid = WIFI_STORE.getLastConnectedSsid();
+  const WifiCredential* cred = ssid.empty() ? nullptr : WIFI_STORE.findCredential(ssid);
+  if (cred == nullptr) {
+    LOG_DBG("SYNC", "No saved WiFi; skipping dashboard sync");
+    return;
+  }
+
+  LOG_DBG("SYNC", "Dashboard sync: connecting to %s", cred->ssid.c_str());
+  WiFi.persistent(false);  // creds owned by WifiCredentialStore; suppress SDK NVS
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true, true);
+  delay(100);
+  if (cred->password.empty()) {
+    WiFi.begin(cred->ssid.c_str());
+  } else {
+    WiFi.begin(cred->ssid.c_str(), cred->password.c_str());
+  }
+
+  constexpr unsigned long CONNECT_TIMEOUT_MS = 7000;
+  const unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < CONNECT_TIMEOUT_MS) {
+    if (WiFi.status() == WL_CONNECT_FAILED || WiFi.status() == WL_NO_SSID_AVAIL) break;
+    delay(100);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    const HttpDownloader::DownloadError r = HttpDownloader::downloadToFile(url, "/sleep.bmp");
+    if (r == HttpDownloader::OK) {
+      if (SETTINGS.sleepScreen != CrossPointSettings::SLEEP_SCREEN_MODE::CUSTOM) {
+        SETTINGS.sleepScreen = CrossPointSettings::SLEEP_SCREEN_MODE::CUSTOM;
+        SETTINGS.saveToFile();  // only when the mode changes (write throttling)
+      }
+      LOG_DBG("SYNC", "Sleep image updated from %s", url.c_str());
+    } else {
+      LOG_DBG("SYNC", "Dashboard download failed (err %d)", static_cast<int>(r));
+    }
+  } else {
+    LOG_DBG("SYNC", "WiFi connect timed out; skipping dashboard sync");
+  }
+
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+}
+
 void enterDeepSleep(bool fromTimeout = false) {
   HalPowerManager::Lock powerLock;  // Ensure we are at normal CPU frequency for sleep preparation
+  syncSleepImageFromUrl();  // pull latest dashboard before the sleep screen renders
   APP_STATE.lastSleepFromReader = activityManager.isReaderActivity();
 
   const bool isQuickResumeSleep =
