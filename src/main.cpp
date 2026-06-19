@@ -263,6 +263,11 @@ static void syncSleepImageFromUrl() {
   std::string url;
   if (!readDashboardUrl(url)) return;  // feature disabled (no /dashboard.url)
 
+  // Visible indicator: the screen still holds the last UI frame at sleep entry,
+  // and the WiFi connect + download blocks for a few seconds. Show a popup so the
+  // user knows a sync is in flight; the sleep-screen render replaces it after.
+  GUI.drawPopup(renderer, tr(STR_DASHBOARD_SYNCING));  // self-refreshes (FAST)
+
   WIFI_STORE.loadFromFile();
   const std::string& ssid = WIFI_STORE.getLastConnectedSsid();
   const WifiCredential* cred = ssid.empty() ? nullptr : WIFI_STORE.findCredential(ssid);
