@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<title>Inbox Catch-Up — Prototype</title>
+<style>
+  :root {
+    --bg: #f2f2f7;
+    --card: #ffffff;
+    --ink: #1c1c1e;
+    --sub: #8a8a8e;
+    --line: #e5e5ea;
+    --archive: #34c759;
+    --unread: #0a84ff;
+    --snooze: #5e5ce6;
+    --accent: #0a84ff;
+    --shadow: 0 1px 3px rgba(0,0,0,0.08), 0 8px 24px rgba(0,0,0,0.06);
+    --safe-top: env(safe-area-inset-top, 0px);
+    --safe-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
+    background: #000;
+    color: var(--ink);
+    overscroll-behavior: none;
+  }
+  /* Phone shell — only visible on wide screens so it reads as a phone */
+  .stage {
+    height: 100%;
+    display: flex; align-items: center; justify-content: center;
+    background: radial-gradient(120% 120% at 50% 0%, #2a2a2e 0%, #050505 60%);
+  }
+  .phone {
+    position: relative;
+    width: 100%; height: 100%;
+    background: var(--bg);
+    display: flex; flex-direction: column;
+    overflow: hidden;
+  }
+  @media (min-width: 480px) {
+    .phone {
+      width: 390px; height: 844px; max-height: 96vh;
+      border-radius: 46px;
+      box-shadow: 0 0 0 12px #1a1a1c, 0 0 0 14px #2c2c2e, 0 30px 80px rgba(0,0,0,0.6);
+    }
+    .notch {
+      position: absolute; top: 9px; left: 50%; transform: translateX(-50%);
+      width: 120px; height: 30px; background: #000; border-radius: 18px; z-index: 50;
+    }
+  }
+  @media (max-width: 479px) { .notch { display: none; } }
+
+  /* Header */
+  header {
+    padding: calc(var(--safe-top) + 14px) 18px 12px;
+    background: rgba(242,242,247,0.86);
+    backdrop-filter: saturate(180%) blur(20px);
+    border-bottom: 1px solid var(--line);
+    z-index: 20;
+  }
+  .h-row { display: flex; align-items: baseline; justify-content: space-between; }
+  h1 { margin: 0; font-size: 28px; font-weight: 800; letter-spacing: -0.02em; }
+  .count { font-size: 14px; color: var(--sub); font-weight: 600; }
+  .hint { margin-top: 6px; font-size: 12px; color: var(--sub); display: flex; gap: 12px; flex-wrap: wrap; }
+  .hint b { color: var(--ink); font-weight: 700; }
+
+  /* List (scrolls) */
+  .list {
+    flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch;
+    padding: 10px 12px 16px;
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  .empty {
+    margin: auto; text-align: center; color: var(--sub); padding: 40px;
+  }
+  .empty .big { font-size: 44px; margin-bottom: 8px; }
+  .empty button {
+    margin-top: 18px; border: 0; background: var(--accent); color: #fff;
+    font-weight: 700; font-size: 15px; padding: 12px 20px; border-radius: 14px;
+  }
+
+  /* Swipeable row */
+  .row { position: relative; border-radius: 18px; }
+  .behind {
+    position: absolute; inset: 0; border-radius: 18px;
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0 26px; color: #fff; font-weight: 800; font-size: 15px;
+    overflow: hidden;
+  }
+  .behind .side { display: flex; align-items: center; gap: 9px; opacity: 0; transition: opacity .08s; }
+  .behind .ic { font-size: 20px; }
+
+  .card {
+    position: relative;
+    background: var(--card);
+    border-radius: 18px;
+    padding: 14px 15px;
+    box-shadow: var(--shadow);
+    display: flex; gap: 12px;
+    touch-action: pan-y;
+    will-change: transform;
+  }
+  .card.snooze-armed { box-shadow: 0 0 0 2px var(--snooze), var(--shadow); }
+  .avatar {
+    flex: 0 0 44px; width: 44px; height: 44px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    color: #fff; font-weight: 700; font-size: 16px; letter-spacing: -0.01em;
+  }
+  .body { flex: 1; min-width: 0; }
+  .line1 { display: flex; align-items: center; gap: 8px; }
+  .dot { flex: 0 0 8px; width: 8px; height: 8px; border-radius: 50%; background: var(--unread); }
+  .from { font-weight: 700; font-size: 15px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .time { font-size: 12px; color: var(--sub); flex: 0 0 auto; }
+  .subject { font-size: 14px; font-weight: 600; margin: 3px 0 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .snippet { font-size: 13px; color: var(--sub); line-height: 1.35; max-height: 2.7em; overflow: hidden; }
+  .read .from { font-weight: 600; }
+  .read .dot { visibility: hidden; }
+  .read .subject { font-weight: 500; }
+
+  /* Compose bar */
+  .compose {
+    border-top: 1px solid var(--line);
+    background: rgba(242,242,247,0.92);
+    backdrop-filter: saturate(180%) blur(20px);
+    padding: 10px 12px calc(var(--safe-bottom) + 10px);
+    display: flex; align-items: flex-end; gap: 10px;
+    z-index: 20;
+  }
+  .compose .field {
+    flex: 1; background: #fff; border: 1px solid var(--line); border-radius: 20px;
+    padding: 9px 14px; display: flex; flex-direction: column; gap: 4px;
+  }
+  .compose .to { font-size: 12px; color: var(--sub); border: 0; outline: 0; width: 100%; }
+  .compose textarea {
+    border: 0; outline: 0; resize: none; font: inherit; font-size: 15px;
+    width: 100%; max-height: 100px; min-height: 22px; line-height: 1.3;
+  }
+  .send {
+    flex: 0 0 auto; width: 40px; height: 40px; border-radius: 50%; border: 0;
+    background: var(--accent); color: #fff; font-size: 18px; display: flex;
+    align-items: center; justify-content: center;
+  }
+  .send:disabled { opacity: .4; }
+
+  /* Toast */
+  .toast {
+    position: absolute; left: 50%; bottom: calc(var(--safe-bottom) + 92px);
+    transform: translate(-50%, 20px); opacity: 0; pointer-events: none;
+    background: #1c1c1e; color: #fff; border-radius: 14px;
+    padding: 11px 14px; display: flex; align-items: center; gap: 14px;
+    font-size: 14px; font-weight: 600; box-shadow: 0 10px 30px rgba(0,0,0,.3);
+    transition: transform .22s cubic-bezier(.2,.8,.2,1), opacity .22s; z-index: 60;
+    max-width: 86%;
+  }
+  .toast.show { transform: translate(-50%, 0); opacity: 1; pointer-events: auto; }
+  .toast .pill { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto; }
+  .toast button { background: transparent; border: 0; color: #4aa8ff; font-weight: 800; font-size: 14px; }
+</style>
+</head>
+<body>
+<div class="stage">
+  <div class="phone">
+    <div class="notch"></div>
+    <header>
+      <div class="h-row">
+        <h1>Catch-Up</h1>
+        <span class="count" id="count"></span>
+      </div>
+      <div class="hint">
+        <span>← <b>Unread</b></span>
+        <span>hold + ← <b>Snooze</b></span>
+        <span>→ <b>Archive</b></span>
+      </div>
+    </header>
+
+    <div class="list" id="list"></div>
+
+    <div class="compose">
+      <div class="field">
+        <input class="to" id="to" placeholder="To:" value="" />
+        <textarea id="msg" rows="1" placeholder="Write an email…"></textarea>
+      </div>
+      <button class="send" id="send" disabled>↑</button>
+    </div>
+
+    <div class="toast" id="toast">
+      <span class="pill" id="toastPill"></span>
+      <span id="toastText"></span>
+      <button id="undo">Undo</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const AVATAR_COLORS = ["#ff9500","#ff375f","#5e5ce6","#34c759","#0a84ff","#ff2d55","#af52de","#ff9f0a"];
+const SEED = [
+  { from: "Stripe", subj: "Your payout of $4,210.55 is on the way", snip: "We've initiated a transfer to your bank account ending in 4242. Funds typically arrive within 2 business days.", time: "9:41 AM", unread: true },
+  { from: "Lara Pence", subj: "Re: Q3 roadmap — can we move the sync?", snip: "Totally works on my end. Thursday 2pm instead of Wednesday? I'll send an updated invite if that's good with you and the team.", time: "8:55 AM", unread: true },
+  { from: "GitHub", subj: "[crosspoint-reader] CI passed on main", snip: "All checks have passed for commit a91f2c. Build Check, Format Check, and Release Build completed successfully.", time: "8:12 AM", unread: true },
+  { from: "Notion", subj: "5 pages were updated in your workspace", snip: "Ben edited 'Launch checklist', Dana commented on 'Pricing v2', and 3 more changes since you last visited.", time: "Yesterday", unread: true },
+  { from: "Dad", subj: "photos from the lake", snip: "Got some great ones of the kids on the dock. Attaching the best dozen — let me know if you want the full set.", time: "Yesterday", unread: false },
+  { from: "AWS", subj: "Your monthly cost is trending 12% higher", snip: "Your forecasted bill for June is $318.40. The increase is primarily driven by S3 and data transfer.", time: "Mon", unread: true },
+  { from: "Figma", subj: "Maya shared 'Catch-Up — iOS' with you", snip: "You now have edit access. Open the file to start collaborating on the swipe interaction prototypes.", time: "Mon", unread: true },
+  { from: "Calendar", subj: "Tomorrow: Dentist, 11:30 AM", snip: "Reminder for your upcoming appointment at Bayview Dental. Reply to this thread to reschedule.", time: "Sun", unread: false },
+];
+
+let emails = SEED.map((e,i)=>({ id:i+1, ...e, color: AVATAR_COLORS[i % AVATAR_COLORS.length] }));
+let lastAction = null; // { email, index, type }
+
+const listEl = document.getElementById("list");
+const countEl = document.getElementById("count");
+
+function initials(name){
+  const p = name.trim().split(/\s+/);
+  return (p[0][0] + (p[1]?p[1][0]:"")).toUpperCase();
+}
+
+const ACTIONS = {
+  archive: { label: "Archive", icon: "🗄", color: "var(--archive)" },
+  unread:  { label: "Mark unread", icon: "✉︎", color: "var(--unread)" },
+  snooze:  { label: "Snooze", icon: "☾", color: "var(--snooze)" },
+};
+
+function render(){
+  listEl.innerHTML = "";
+  countEl.textContent = emails.length ? emails.length + " to triage" : "";
+  if(!emails.length){
+    const d = document.createElement("div");
+    d.className = "empty";
+    d.innerHTML = '<div class="big">🎉</div><div>Inbox zero. Nice.</div><button id="reset">Reload demo</button>';
+    listEl.appendChild(d);
+    document.getElementById("reset").onclick = ()=>{ emails = SEED.map((e,i)=>({id:i+1,...e,color:AVATAR_COLORS[i%AVATAR_COLORS.length]})); render(); };
+    return;
+  }
+  for(const e of emails) listEl.appendChild(rowFor(e));
+}
+
+function rowFor(e){
+  const row = document.createElement("div");
+  row.className = "row";
+
+  const behind = document.createElement("div");
+  behind.className = "behind";
+  // left side shows when swiping right (archive). right side shows when swiping left (unread/snooze)
+  behind.innerHTML =
+    '<span class="side left"><span class="ic">🗄</span><span class="lbl-left">Archive</span></span>' +
+    '<span class="side right"><span class="lbl-right">Mark unread</span><span class="ic ic-right">✉︎</span></span>';
+
+  const card = document.createElement("div");
+  card.className = "card " + (e.unread ? "unread" : "read");
+  card.innerHTML =
+    '<div class="avatar" style="background:'+e.color+'">'+initials(e.from)+'</div>' +
+    '<div class="body">' +
+      '<div class="line1"><span class="dot"></span><span class="from">'+e.from+'</span><span class="time">'+e.time+'</span></div>' +
+      '<div class="subject">'+e.subj+'</div>' +
+      '<div class="snippet">'+e.snip+'</div>' +
+    '</div>';
+
+  row.appendChild(behind);
+  row.appendChild(card);
+  attachSwipe(row, card, behind, e);
+  return row;
+}
+
+function attachSwipe(row, card, behind, email){
+  let startX=0, startY=0, dx=0, dragging=false, decided=false, holdTimer=null, armed=false;
+  const THRESH = 96;            // px to commit
+  const HOLD_MS = 280;          // press-and-hold to arm snooze
+  const leftSide = behind.querySelector(".side.left");
+  const rightSide = behind.querySelector(".side.right");
+  const lblRight = behind.querySelector(".lbl-right");
+  const icRight = behind.querySelector(".ic-right");
+
+  function setArmed(on){
+    armed = on;
+    card.classList.toggle("snooze-armed", on);
+    if(on && navigator.vibrate) navigator.vibrate(12);
+  }
+
+  function down(x,y){
+    startX=x; startY=y; dx=0; dragging=true; decided=false;
+    card.style.transition = "none";
+    holdTimer = setTimeout(()=>{ if(dragging && Math.abs(dx)<8) setArmed(true); }, HOLD_MS);
+  }
+  function move(x,y){
+    if(!dragging) return;
+    const ddx = x-startX, ddy = y-startY;
+    if(!decided){
+      if(Math.abs(ddy) > Math.abs(ddx) && Math.abs(ddy) > 10){ // vertical scroll wins
+        dragging=false; clearTimeout(holdTimer); return;
+      }
+      if(Math.abs(ddx) > 8){ decided=true; clearTimeout(holdTimer); }
+    }
+    dx = ddx;
+    card.style.transform = "translateX("+dx+"px)";
+    // reveal correct side + label
+    const swipingLeft = dx < 0;
+    rightSide.style.opacity = swipingLeft ? Math.min(1, Math.abs(dx)/THRESH) : 0;
+    leftSide.style.opacity  = swipingLeft ? 0 : Math.min(1, Math.abs(dx)/THRESH);
+    if(swipingLeft){
+      const a = armed ? ACTIONS.snooze : ACTIONS.unread;
+      lblRight.textContent = a.label; icRight.textContent = a.icon;
+      behind.style.background = a.color;
+    } else {
+      behind.style.background = ACTIONS.archive.color;
+    }
+  }
+  function up(){
+    if(!dragging){ clearTimeout(holdTimer); return; }
+    dragging=false; clearTimeout(holdTimer);
+    const past = Math.abs(dx) > THRESH;
+    if(past){
+      const type = dx>0 ? "archive" : (armed ? "snooze" : "unread");
+      commit(row, card, email, type, dx>0 ? 1 : -1);
+    } else {
+      card.style.transition = "transform .26s cubic-bezier(.2,.8,.2,1)";
+      card.style.transform = "translateX(0)";
+      setArmed(false);
+    }
+  }
+
+  // Pointer events cover both touch + mouse
+  card.addEventListener("pointerdown", ev=>{ card.setPointerCapture(ev.pointerId); down(ev.clientX, ev.clientY); });
+  card.addEventListener("pointermove", ev=> move(ev.clientX, ev.clientY));
+  card.addEventListener("pointerup", up);
+  card.addEventListener("pointercancel", up);
+}
+
+function commit(row, card, email, type, dir){
+  if(navigator.vibrate) navigator.vibrate(type==="snooze"?[10,40,10]:18);
+  card.style.transition = "transform .24s ease-in";
+  card.style.transform = "translateX("+(dir*window.innerWidth)+"px)";
+  row.style.transition = "height .24s ease, opacity .2s, margin .24s";
+  const h = row.offsetHeight; row.style.height = h+"px";
+  requestAnimationFrame(()=>{ row.style.height="0px"; row.style.opacity="0"; row.style.margin="0"; });
+  setTimeout(()=>{
+    const idx = emails.findIndex(e=>e.id===email.id);
+    if(idx>-1){
+      if(type==="unread") emails[idx].unread = true;
+      lastAction = { email: emails[idx], index: idx, type };
+      emails.splice(idx,1);
+      render();
+      showToast(type);
+    }
+  }, 240);
+}
+
+const toast = document.getElementById("toast");
+let toastTimer=null;
+function showToast(type){
+  const a = ACTIONS[type];
+  document.getElementById("toastText").textContent = a.label + (type==="snooze" ? " · until tomorrow 9 AM" : "");
+  document.getElementById("toastPill").style.background = a.color.replace("var(--archive)","#34c759").replace("var(--unread)","#0a84ff").replace("var(--snooze)","#5e5ce6");
+  // resolve color reliably
+  document.getElementById("toastPill").style.background = ({archive:"#34c759",unread:"#0a84ff",snooze:"#5e5ce6"})[type];
+  toast.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(()=>toast.classList.remove("show"), 3200);
+}
+document.getElementById("undo").onclick = ()=>{
+  if(!lastAction) return;
+  emails.splice(Math.min(lastAction.index, emails.length), 0, lastAction.email);
+  lastAction=null; toast.classList.remove("show"); render();
+};
+
+// Compose
+const msg = document.getElementById("msg");
+const send = document.getElementById("send");
+msg.addEventListener("input", ()=>{
+  msg.style.height="auto"; msg.style.height=Math.min(100, msg.scrollHeight)+"px";
+  send.disabled = msg.value.trim().length===0;
+});
+send.onclick = ()=>{
+  if(msg.value.trim().length===0) return;
+  msg.value=""; msg.style.height="auto"; send.disabled=true;
+  document.getElementById("toastText").textContent = "Sent ✓";
+  document.getElementById("toastPill").style.background = "#34c759";
+  document.getElementById("undo").style.display="none";
+  toast.classList.add("show");
+  clearTimeout(toastTimer); toastTimer=setTimeout(()=>{ toast.classList.remove("show"); document.getElementById("undo").style.display=""; }, 1800);
+};
+
+render();
+</script>
+</body>
+</html>
