@@ -1,0 +1,12 @@
+# Local copy of the prototype filled with real inbox content — never commit
+web-prototype/index.local.html
+
+# Xcode
+**/xcuserdata/
+**/*.xcworkspace/xcuserdata/
+DerivedData/
+build/
+*.xcuserstate
+
+# macOS
+.DS_Store
