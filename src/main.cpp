@@ -27,13 +27,14 @@
 #include "RecentBooksStore.h"
 #include "SdCardFontSystem.h"
 #include "WifiCredentialStore.h"
-#include "network/HttpDownloader.h"
 #include "activities/Activity.h"
 #include "activities/ActivityManager.h"
+#include "activities/boot_sleep/SleepActivity.h"
 #include "activities/settings/SdFirmwareUpdateActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "images/LoadingIcon.h"
+#include "network/HttpDownloader.h"
 #include "util/ButtonNavigator.h"
 #include "util/ScreenshotUtil.h"
 
@@ -240,14 +241,21 @@ static bool loadSleepFrameBuffer() {
 // ── Dashboard auto-sync ──────────────────────────────────────────────────────
 // Optional: if the SD card root holds a "/dashboard.url" file containing a single
 // http(s) URL, briefly bring up WiFi (last saved network), download that URL into
-// /sleep.bmp, switch the sleep screen to CUSTOM, then tear WiFi back down. The
-// file's presence is the on/off switch, and editing it re-points the source with
-// no firmware rebuild. Invoked at sleep entry so the freshly fetched image is what
-// the sleep screen renders this sleep.
+// /sleep.bmp, then tear WiFi back down. The file's presence is the on/off switch
+// (SleepActivity renders /sleep.bmp whenever the file exists — the user's
+// configured sleep screen mode is never rewritten), and editing it re-points the
+// source with no firmware rebuild.
+//
+// Invoked from enterDeepSleep() AFTER goToSleep() has torn down the outgoing
+// activity: the reader holds ~65KB (Epub + Section) that the WiFi stack and a
+// TLS handshake need (the KOReader sync flow frees both before connecting for
+// the same reason). Never invoked for quick-resume sleeps — there the sleep
+// screen is the user's live session frame and a downloaded image is not shown.
+// Returns true when a fresh image landed so the caller can repaint with it.
 static bool readDashboardUrl(std::string& out) {
-  if (!Storage.exists("/dashboard.url")) return false;
+  if (!Storage.exists(DASHBOARD_URL_FILE)) return false;
   HalFile f;
-  if (!Storage.openFileForRead("SYNC", "/dashboard.url", f)) return false;
+  if (!Storage.openFileForRead("SYNC", DASHBOARD_URL_FILE, f)) return false;
   char buf[192] = {0};
   const int n = f.read(buf, sizeof(buf) - 1);  // f auto-closes at scope exit
   if (n <= 0) return false;
@@ -259,21 +267,16 @@ static bool readDashboardUrl(std::string& out) {
   return out.rfind("http", 0) == 0;  // sanity: must look like a URL
 }
 
-static void syncSleepImageFromUrl() {
+static bool syncSleepImageFromUrl() {
   std::string url;
-  if (!readDashboardUrl(url)) return;  // feature disabled (no /dashboard.url)
-
-  // Visible indicator: the screen still holds the last UI frame at sleep entry,
-  // and the WiFi connect + download blocks for a few seconds. Show a popup so the
-  // user knows a sync is in flight; the sleep-screen render replaces it after.
-  GUI.drawPopup(renderer, tr(STR_DASHBOARD_SYNCING));  // self-refreshes (FAST)
+  if (!readDashboardUrl(url)) return false;  // feature disabled (no /dashboard.url)
 
   WIFI_STORE.loadFromFile();
   const std::string& ssid = WIFI_STORE.getLastConnectedSsid();
   const WifiCredential* cred = ssid.empty() ? nullptr : WIFI_STORE.findCredential(ssid);
   if (cred == nullptr) {
     LOG_DBG("SYNC", "No saved WiFi; skipping dashboard sync");
-    return;
+    return false;
   }
 
   LOG_DBG("SYNC", "Dashboard sync: connecting to %s", cred->ssid.c_str());
@@ -294,13 +297,14 @@ static void syncSleepImageFromUrl() {
     delay(100);
   }
 
+  bool updated = false;
   if (WiFi.status() == WL_CONNECTED) {
-    const HttpDownloader::DownloadError r = HttpDownloader::downloadToFile(url, "/sleep.bmp");
+    // Download to a temp path and swap on success, so a failed fetch keeps the
+    // last good image (downloadToFile deletes its destination before writing).
+    const HttpDownloader::DownloadError r = HttpDownloader::downloadToFile(url, "/sleep.bmp.tmp");
     if (r == HttpDownloader::OK) {
-      if (SETTINGS.sleepScreen != CrossPointSettings::SLEEP_SCREEN_MODE::CUSTOM) {
-        SETTINGS.sleepScreen = CrossPointSettings::SLEEP_SCREEN_MODE::CUSTOM;
-        SETTINGS.saveToFile();  // only when the mode changes (write throttling)
-      }
+      if (Storage.exists("/sleep.bmp")) Storage.remove("/sleep.bmp");
+      updated = Storage.rename("/sleep.bmp.tmp", "/sleep.bmp");
       LOG_DBG("SYNC", "Sleep image updated from %s", url.c_str());
     } else {
       LOG_DBG("SYNC", "Dashboard download failed (err %d)", static_cast<int>(r));
@@ -311,11 +315,11 @@ static void syncSleepImageFromUrl() {
 
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
+  return updated;
 }
 
 void enterDeepSleep(bool fromTimeout = false) {
   HalPowerManager::Lock powerLock;  // Ensure we are at normal CPU frequency for sleep preparation
-  syncSleepImageFromUrl();  // pull latest dashboard before the sleep screen renders
   APP_STATE.lastSleepFromReader = activityManager.isReaderActivity();
 
   const bool isQuickResumeSleep =
@@ -332,7 +336,14 @@ void enterDeepSleep(bool fromTimeout = false) {
   activityManager.goToSleep(fromTimeout);
 
   if (isQuickResumeSleep) {
+    // Quick resume is the user's saved session: persist the frame untouched and
+    // skip the dashboard sync (its image would not be shown, and WiFi would only
+    // delay sleep and drain the battery).
     saveSleepFrameBuffer();
+  } else if (syncSleepImageFromUrl()) {
+    // A fresh dashboard landed in /sleep.bmp: repaint so this sleep shows it
+    // (the paint above showed the previous image while WiFi was up).
+    activityManager.goToSleep(fromTimeout);
   }
 
   // Tear down WiFi so the modem power domain isn't held alive across deep sleep.
