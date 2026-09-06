@@ -16,6 +16,7 @@
 #include <WiFi.h>
 #include <builtinFonts/all.h>
 
+#include <algorithm>
 #include <cstring>
 #include <string>
 
@@ -237,40 +238,77 @@ static bool loadSleepFrameBuffer() {
   return true;
 }
 
-// Enter deep sleep mode
 // ── Dashboard auto-sync ──────────────────────────────────────────────────────
-// Optional: if the SD card root holds a "/dashboard.url" file containing a single
-// http(s) URL, briefly bring up WiFi (last saved network), download that URL into
-// /sleep.bmp, then tear WiFi back down. The file's presence is the on/off switch
-// (SleepActivity renders /sleep.bmp whenever the file exists — the user's
-// configured sleep screen mode is never rewritten), and editing it re-points the
-// source with no firmware rebuild.
+// Optional: if the SD card root holds a "/dashboard.url" file, briefly bring up
+// WiFi (last saved network), download that URL into /sleep.bmp, then tear WiFi
+// back down. The file's presence is the on/off switch (SleepActivity renders
+// /sleep.bmp whenever the file exists — the user's configured sleep screen mode
+// is never rewritten), and editing it re-points the source with no firmware
+// rebuild.
+//
+// File format (see docs/dashboard-sync.md):
+//   line 1: http(s) URL of a BMP image
+//   line 2: optional refresh interval in minutes (default 60, 0 = only at sleep entry)
 //
 // Invoked from enterDeepSleep() AFTER goToSleep() has torn down the outgoing
 // activity: the reader holds ~65KB (Epub + Section) that the WiFi stack and a
 // TLS handshake need (the KOReader sync flow frees both before connecting for
 // the same reason). Never invoked for quick-resume sleeps — there the sleep
 // screen is the user's live session frame and a downloaded image is not shown.
-// Returns true when a fresh image landed so the caller can repaint with it.
-static bool readDashboardUrl(std::string& out) {
+//
+// While USB-powered, an RTC timer wake re-runs the fetch every `refreshMinutes`
+// so the sleeping screen keeps tracking the source. On battery the MCU is
+// powered off during sleep (see HalPowerManager::startDeepSleep), so the
+// periodic refresh is silently unavailable there.
+namespace {
+constexpr uint32_t DASHBOARD_DEFAULT_REFRESH_MINUTES = 60;
+constexpr uint32_t DASHBOARD_MIN_REFRESH_MINUTES = 5;
+constexpr uint32_t DASHBOARD_MAX_REFRESH_MINUTES = 24 * 60;
+
+struct DashboardConfig {
+  std::string url;
+  uint32_t refreshMinutes = DASHBOARD_DEFAULT_REFRESH_MINUTES;
+};
+
+std::string trimWhitespace(const std::string& s) {
+  const size_t start = s.find_first_not_of(" \t\r\n");
+  if (start == std::string::npos) return {};
+  const size_t end = s.find_last_not_of(" \t\r\n");
+  return s.substr(start, end - start + 1);
+}
+}  // namespace
+
+static bool readDashboardConfig(DashboardConfig& out) {
   if (!Storage.exists(DASHBOARD_URL_FILE)) return false;
   HalFile f;
   if (!Storage.openFileForRead("SYNC", DASHBOARD_URL_FILE, f)) return false;
-  char buf[192] = {0};
+  char buf[256] = {0};
   const int n = f.read(buf, sizeof(buf) - 1);  // f auto-closes at scope exit
   if (n <= 0) return false;
-  out.assign(buf, n);
-  const size_t start = out.find_first_not_of(" \t\r\n");
-  const size_t end = out.find_last_not_of(" \t\r\n");
-  if (start == std::string::npos) return false;
-  out = out.substr(start, end - start + 1);
-  return out.rfind("http", 0) == 0;  // sanity: must look like a URL
+
+  const std::string text(buf, n);
+  const size_t eol = text.find_first_of("\r\n");
+  out.url = trimWhitespace(text.substr(0, eol));
+  if (out.url.rfind("http", 0) != 0) return false;  // sanity: must look like a URL
+
+  out.refreshMinutes = DASHBOARD_DEFAULT_REFRESH_MINUTES;
+  if (eol != std::string::npos) {
+    const std::string interval = trimWhitespace(text.substr(eol));
+    if (!interval.empty()) {
+      char* endp = nullptr;
+      const unsigned long minutes = strtoul(interval.c_str(), &endp, 10);
+      if (endp != interval.c_str()) {
+        out.refreshMinutes = minutes == 0 ? 0
+                                          : std::max(DASHBOARD_MIN_REFRESH_MINUTES,
+                                                     std::min<uint32_t>(minutes, DASHBOARD_MAX_REFRESH_MINUTES));
+      }
+    }
+  }
+  return true;
 }
 
-static bool syncSleepImageFromUrl() {
-  std::string url;
-  if (!readDashboardUrl(url)) return false;  // feature disabled (no /dashboard.url)
-
+// Returns true when a fresh image landed in /sleep.bmp so the caller can repaint with it.
+static bool syncSleepImageFromUrl(const std::string& url) {
   WIFI_STORE.loadFromFile();
   const std::string& ssid = WIFI_STORE.getLastConnectedSsid();
   const WifiCredential* cred = ssid.empty() ? nullptr : WIFI_STORE.findCredential(ssid);
@@ -318,9 +356,16 @@ static bool syncSleepImageFromUrl() {
   return updated;
 }
 
-void enterDeepSleep(bool fromTimeout = false) {
+// Enter deep sleep mode.
+// dashboardRefresh: this boot was a timer wake whose only job is to re-fetch the
+// dashboard image and go back to sleep. No foreground activity exists, so the
+// user's real sleep context (reader vs. home) and the saved app state are left
+// untouched for the next power-button wake.
+void enterDeepSleep(bool fromTimeout = false, bool dashboardRefresh = false) {
   HalPowerManager::Lock powerLock;  // Ensure we are at normal CPU frequency for sleep preparation
-  APP_STATE.lastSleepFromReader = activityManager.isReaderActivity();
+  if (!dashboardRefresh) {
+    APP_STATE.lastSleepFromReader = activityManager.isReaderActivity();
+  }
 
   const bool isQuickResumeSleep =
       SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::QUICK_RESUME ||
@@ -328,22 +373,35 @@ void enterDeepSleep(bool fromTimeout = false) {
        SETTINGS.quickResumeSleepScreen == CrossPointSettings::QUICK_RESUME_SLEEP_SCREEN::QUICK_RESUME_AFTER_TIMEOUT);
   APP_STATE.showBootScreen = !isQuickResumeSleep;
 
-  APP_STATE.saveToFile();
+  // A refresh boot changes no app state; skip the SPIFFS write (hourly sleeps would otherwise burn erase cycles).
+  if (!dashboardRefresh) {
+    APP_STATE.saveToFile();
+  }
 
   // Commit to sleeping before goToSleep() runs the outgoing activity's onExit():
   // a WiFi activity would otherwise silentRestart() here and reboot instead.
   deepSleepInProgress = true;
-  activityManager.goToSleep(fromTimeout);
+  // On a refresh boot the panel already shows the previous dashboard; defer the
+  // single paint until after the fetch so the screen doesn't flash twice.
+  if (!dashboardRefresh) {
+    activityManager.goToSleep(fromTimeout);
+  }
 
+  DashboardConfig dashboard;
+  const bool hasDashboard = readDashboardConfig(dashboard);
   if (isQuickResumeSleep) {
     // Quick resume is the user's saved session: persist the frame untouched and
     // skip the dashboard sync (its image would not be shown, and WiFi would only
     // delay sleep and drain the battery).
     saveSleepFrameBuffer();
-  } else if (syncSleepImageFromUrl()) {
+  } else if (hasDashboard) {
+    const bool updated = syncSleepImageFromUrl(dashboard.url);
     // A fresh dashboard landed in /sleep.bmp: repaint so this sleep shows it
-    // (the paint above showed the previous image while WiFi was up).
-    activityManager.goToSleep(fromTimeout);
+    // (the paint above showed the previous image while WiFi was up). A refresh
+    // boot has not painted yet, so it paints here even with the last good image.
+    if (updated || dashboardRefresh) {
+      activityManager.goToSleep(fromTimeout);
+    }
   }
 
   // Tear down WiFi so the modem power domain isn't held alive across deep sleep.
@@ -357,7 +415,14 @@ void enterDeepSleep(bool fromTimeout = false) {
   display.deepSleep();
   LOG_DBG("MAIN", "Entering deep sleep");
 
-  powerManager.startDeepSleep(gpio);
+  // Periodic dashboard refresh: arm an RTC timer wake so the next boot re-fetches
+  // the image. Only armed on USB power, where the MCU stays alive through sleep.
+  uint64_t timerWakeupUs = 0;
+  if (hasDashboard && !isQuickResumeSleep && dashboard.refreshMinutes > 0 && gpio.isUsbConnected()) {
+    timerWakeupUs = static_cast<uint64_t>(dashboard.refreshMinutes) * 60ULL * 1000000ULL;
+    LOG_DBG("SYNC", "Dashboard refresh armed: %lu min", static_cast<unsigned long>(dashboard.refreshMinutes));
+  }
+  powerManager.startDeepSleep(gpio, timerWakeupUs);
 }
 
 void setupDisplayAndFonts(bool seamless = false) {
@@ -455,6 +520,14 @@ void setup() {
       // If USB power caused a cold boot, go back to sleep
       LOG_DBG("MAIN", "Wakeup reason: After USB Power");
       powerManager.startDeepSleep(gpio);
+      break;
+    case HalGPIO::WakeupReason::Timer:
+      // USB-powered dashboard refresh: bring up the display without the splash,
+      // re-fetch and re-render the sleep image, then sleep again with the timer
+      // re-armed. No UI is entered, so the power button still wakes normally.
+      LOG_DBG("MAIN", "Wakeup reason: Timer (dashboard refresh)");
+      setupDisplayAndFonts(/*seamless=*/true);
+      enterDeepSleep(/*fromTimeout=*/false, /*dashboardRefresh=*/true);  // does not return
       break;
     case HalGPIO::WakeupReason::AfterFlash:
       // After flashing, just proceed to boot

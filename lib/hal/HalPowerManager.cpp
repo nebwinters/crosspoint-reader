@@ -60,7 +60,7 @@ void HalPowerManager::setPowerSaving(bool enabled) {
   // Otherwise, no change needed
 }
 
-void HalPowerManager::startDeepSleep(HalGPIO& gpio) const {
+void HalPowerManager::startDeepSleep(HalGPIO& gpio, uint64_t timerWakeupUs) const {
   // Ensure that the power button has been released to avoid immediately turning back on if you're holding it
   while (gpio.isPressed(HalGPIO::BTN_POWER)) {
     delay(50);
@@ -90,6 +90,10 @@ void HalPowerManager::startDeepSleep(HalGPIO& gpio) const {
   // power button is hard-wired to briefly provide power to the MCU, waking it up regardless of the wakeup source
   // configuration
   esp_deep_sleep_enable_gpio_wakeup(1ULL << InputManager::POWER_BUTTON_PIN, ESP_GPIO_WAKEUP_GPIO_LOW);
+  // Optional timer wake (USB-powered only, see header). The GPIO wake above stays armed alongside it.
+  if (timerWakeupUs > 0) {
+    esp_sleep_enable_timer_wakeup(timerWakeupUs);
+  }
   // Enter Deep Sleep
   esp_deep_sleep_start();
 }

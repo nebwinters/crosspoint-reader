@@ -86,7 +86,9 @@ class HalGPIO {
   // Returns true once per edge (plug or unplug) since the last update()
   bool wasUsbStateChanged() const;
 
-  enum class WakeupReason { PowerButton, AfterFlash, AfterUSBPower, Other };
+  // Timer: RTC timer wake armed by HalPowerManager::startDeepSleep(). Only reachable on USB power — on battery the
+  // latch MOSFET cuts power to the MCU during sleep, so no timer can fire.
+  enum class WakeupReason { PowerButton, AfterFlash, AfterUSBPower, Timer, Other };
 
   WakeupReason getWakeupReason() const;
 
