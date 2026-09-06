@@ -83,7 +83,9 @@ If there is no status file at all, the sync never ran, so check in this order:
    the web Home page ends in a branch name and commit hash).
 2. `dashboard.url` is in the SD root, starts with `http`, and is under 250
    characters.
-3. A saved Wi-Fi network is in range. The sync gives up after 7 seconds.
+3. A saved Wi-Fi network is in range. Each join gets 12 seconds and one retry
+   (about 36 seconds worst case), so a weak signal mostly works but a dead one
+   does not stall sleep for long.
 4. The URL is reachable and returns a BMP. Open it in a phone browser to check.
 5. Start **File Transfer** and inspect `sleep.bmp` in the SD root via the web
    File Manager. Its size and whether it opens as an image tells you whether a

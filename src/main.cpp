@@ -394,25 +394,39 @@ static bool connectToSavedNetwork() {
     return false;
   }
 
-  constexpr unsigned long CONNECT_TIMEOUT_MS = 7000;
-  constexpr size_t MAX_ATTEMPTS = 3;  // bounds the worst case at ~21s of radio time
-  for (size_t n = 0; n < candidates.size() && n < MAX_ATTEMPTS; n++) {
+  // At a weak signal (rssi -75..-80 on a desk across the house) a single 7 s join
+  // was a coin flip on hardware, and every miss costs a whole refresh cycle. Give
+  // each candidate a longer window and one retry, and keep the modem out of
+  // power-save while associating. Worst case is bounded at ~36 s of radio time;
+  // on USB that is free, on battery it only delays the (rare) failed sleep.
+  constexpr unsigned long CONNECT_TIMEOUT_MS = 12000;
+  constexpr int TRIES_PER_NETWORK = 2;
+  constexpr size_t MAX_ATTEMPTS = 3;
+  WiFi.setSleep(false);
+  size_t attempts = 0;
+  for (size_t n = 0; n < candidates.size() && attempts < MAX_ATTEMPTS; n++) {
     const WifiCredential* cred = candidates[n].cred;
-    LOG_DBG("SYNC", "Dashboard sync: connecting to %s (rssi %ld)", cred->ssid.c_str(),
-            static_cast<long>(candidates[n].rssi));
-    if (cred->password.empty()) {
-      WiFi.begin(cred->ssid.c_str());
-    } else {
-      WiFi.begin(cred->ssid.c_str(), cred->password.c_str());
+    for (int attempt = 1; attempt <= TRIES_PER_NETWORK && attempts < MAX_ATTEMPTS; attempt++, attempts++) {
+      LOG_DBG("SYNC", "Dashboard sync: connecting to %s (rssi %ld, try %d/%d)", cred->ssid.c_str(),
+              static_cast<long>(candidates[n].rssi), attempt, TRIES_PER_NETWORK);
+      if (cred->password.empty()) {
+        WiFi.begin(cred->ssid.c_str());
+      } else {
+        WiFi.begin(cred->ssid.c_str(), cred->password.c_str());
+      }
+      const unsigned long start = millis();
+      while (WiFi.status() != WL_CONNECTED && millis() - start < CONNECT_TIMEOUT_MS) {
+        if (WiFi.status() == WL_CONNECT_FAILED) break;  // wrong password: no point waiting
+        delay(100);
+      }
+      if (WiFi.status() == WL_CONNECTED) {
+        LOG_DBG("SYNC", "Dashboard sync: joined %s in %lu ms", cred->ssid.c_str(), millis() - start);
+        return true;
+      }
+      LOG_DBG("SYNC", "Dashboard sync: join failed (status %d)", static_cast<int>(WiFi.status()));
+      WiFi.disconnect(true, true);
+      delay(250);
     }
-    const unsigned long start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < CONNECT_TIMEOUT_MS) {
-      if (WiFi.status() == WL_CONNECT_FAILED || WiFi.status() == WL_NO_SSID_AVAIL) break;
-      delay(100);
-    }
-    if (WiFi.status() == WL_CONNECTED) return true;
-    WiFi.disconnect(true, true);
-    delay(100);
   }
   LOG_DBG("SYNC", "WiFi connect timed out; skipping dashboard sync");
   writeDashboardStatus("wifi-failed", "connect timed out");
