@@ -65,3 +65,41 @@ Failures are logged over serial only, so check in this order:
 5. Start **File Transfer** and inspect `sleep.bmp` in the SD root via the web
    File Manager. Its size and whether it opens as an image tells you whether a
    download ever succeeded.
+
+## Unattended firmware updates
+
+Readers running this fork update themselves. Every push to `master` builds a
+release (`.github/workflows/fork-release.yml`) versioned `MAJOR.MINOR.<run>` and
+publishes `firmware.bin` under the fork's GitHub releases. The over-the-air
+updater points at that feed, and dashboard refreshes double as the update check:
+
+- Roughly every 6 hours of refreshes, while the network is up for the image
+  fetch, the reader asks GitHub for the latest release.
+- If it is newer than the running build it downloads and flashes it, then
+  restarts straight back into the dashboard sleep loop. No screen is shown.
+- Failures leave the current firmware in place and are retried at the next
+  check. A user-initiated sleep never waits on an update; only the automatic
+  refreshes do.
+
+Settings > System > Check for updates uses the same fork feed, so a manual
+check is still possible. The base version lives in `platformio.ini`; bump
+`MAJOR.MINOR` there when merging upstream so fork releases stay ahead of the
+build already on the device.
+
+## Battery refresh (opt-in)
+
+Add a line containing `battery` to `dashboard.url` and the reader keeps
+refreshing on battery too. Instead of powering off it parks in light sleep
+between fetches, so the timer can fire. This keeps the whole board powered
+while asleep and will noticeably shorten battery life; the exact cost depends
+on the board's idle draw, which has not been measured. The power button still
+wakes the reader normally. Without the line, battery behavior is unchanged:
+one refresh at each sleep entry.
+
+## Choosing networks
+
+The sync scans and joins the strongest saved network in range, trying up to
+three, and always falls back to the last connected network even if the scan
+missed it. That covers an idle phone hotspot, which stops beaconing until a
+client tries to join. Save both your home network and your hotspot on the
+reader and it will use whichever is available.
