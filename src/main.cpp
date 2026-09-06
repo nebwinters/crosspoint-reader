@@ -387,7 +387,10 @@ static bool connectToSavedNetwork() {
   }
   if (candidates.empty()) {
     LOG_DBG("SYNC", "No saved WiFi in range; skipping dashboard sync");
-    writeDashboardStatus("wifi-failed", "no saved network in range");
+    char detail[64];
+    snprintf(detail, sizeof(detail), "no saved network in range (scan saw %d, %u saved)", static_cast<int>(found),
+             static_cast<unsigned>(saved.size()));
+    writeDashboardStatus("wifi-failed", detail);
     return false;
   }
 
@@ -568,6 +571,10 @@ void enterDeepSleep(bool fromTimeout = false, bool dashboardRefresh = false) {
     // skip the dashboard sync (its image would not be shown, and WiFi would only
     // delay sleep and drain the battery).
     saveSleepFrameBuffer();
+    if (hasDashboard) writeDashboardStatus("skipped", "quick-resume sleep");
+  } else if (!hasDashboard && Storage.exists(DASHBOARD_URL_FILE)) {
+    // File present but unusable: say so, otherwise this looks identical to the feature being off.
+    writeDashboardStatus("disabled", "first line of dashboard.url is not an http(s) URL");
   } else if (hasDashboard) {
     // Self-update only on refresh boots: a user-initiated sleep should not
     // stall for a firmware download.
