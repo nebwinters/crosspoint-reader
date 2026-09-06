@@ -36,6 +36,7 @@
 #include "fontIds.h"
 #include "images/LoadingIcon.h"
 #include "network/HttpDownloader.h"
+#include "network/OtaUpdater.h"
 #include "util/ButtonNavigator.h"
 #include "util/ScreenshotUtil.h"
 
@@ -249,6 +250,7 @@ static bool loadSleepFrameBuffer() {
 // File format (see docs/dashboard-sync.md):
 //   line 1: http(s) URL of a BMP image
 //   line 2: optional refresh interval in minutes (default 60, 0 = only at sleep entry)
+//   any later line "battery": also refresh on battery, using light sleep
 //
 // Invoked from enterDeepSleep() AFTER goToSleep() has torn down the outgoing
 // activity: the reader holds ~65KB (Epub + Section) that the WiFi stack and a
@@ -258,8 +260,9 @@ static bool loadSleepFrameBuffer() {
 //
 // While USB-powered, an RTC timer wake re-runs the fetch every `refreshMinutes`
 // so the sleeping screen keeps tracking the source. On battery the MCU is
-// powered off during sleep (see HalPowerManager::startDeepSleep), so the
-// periodic refresh is silently unavailable there.
+// powered off during deep sleep (see HalPowerManager::startDeepSleep), so the
+// periodic refresh is only available there when the file opts into the
+// light-sleep loop with "battery" — which keeps the MCU alive and costs battery.
 namespace {
 constexpr uint32_t DASHBOARD_DEFAULT_REFRESH_MINUTES = 60;
 constexpr uint32_t DASHBOARD_MIN_REFRESH_MINUTES = 5;
@@ -268,6 +271,7 @@ constexpr uint32_t DASHBOARD_MAX_REFRESH_MINUTES = 24 * 60;
 struct DashboardConfig {
   std::string url;
   uint32_t refreshMinutes = DASHBOARD_DEFAULT_REFRESH_MINUTES;
+  bool refreshOnBattery = false;
 };
 
 std::string trimWhitespace(const std::string& s) {
@@ -292,68 +296,213 @@ static bool readDashboardConfig(DashboardConfig& out) {
   if (out.url.rfind("http", 0) != 0) return false;  // sanity: must look like a URL
 
   out.refreshMinutes = DASHBOARD_DEFAULT_REFRESH_MINUTES;
-  if (eol != std::string::npos) {
-    const std::string interval = trimWhitespace(text.substr(eol));
-    if (!interval.empty()) {
-      char* endp = nullptr;
-      const unsigned long minutes = strtoul(interval.c_str(), &endp, 10);
-      if (endp != interval.c_str()) {
-        out.refreshMinutes = minutes == 0 ? 0
-                                          : std::max(DASHBOARD_MIN_REFRESH_MINUTES,
-                                                     std::min<uint32_t>(minutes, DASHBOARD_MAX_REFRESH_MINUTES));
-      }
+  out.refreshOnBattery = false;
+  // Remaining lines: a bare number sets the interval, "battery" opts into the
+  // light-sleep refresh loop. Order does not matter; unknown lines are ignored.
+  size_t pos = eol;
+  while (pos != std::string::npos) {
+    const size_t next = text.find_first_of("\r\n", pos + 1);
+    const std::string line = trimWhitespace(text.substr(pos, next == std::string::npos ? next : next - pos));
+    pos = next;
+    if (line.empty()) continue;
+    if (strcasecmp(line.c_str(), "battery") == 0) {
+      out.refreshOnBattery = true;
+      continue;
+    }
+    char* endp = nullptr;
+    const unsigned long minutes = strtoul(line.c_str(), &endp, 10);
+    if (endp != line.c_str()) {
+      out.refreshMinutes = minutes == 0 ? 0
+                                        : std::max(DASHBOARD_MIN_REFRESH_MINUTES,
+                                                   std::min<uint32_t>(minutes, DASHBOARD_MAX_REFRESH_MINUTES));
     }
   }
   return true;
 }
 
-// Returns true when a fresh image landed in /sleep.bmp so the caller can repaint with it.
-static bool syncSleepImageFromUrl(const std::string& url) {
+// Join the best saved network in range: scan, rank saved SSIDs by signal, and
+// try them strongest-first. An idle phone hotspot stops beaconing and will not
+// show up in a scan, so the last connected network is always tried as a final
+// fallback even when the scan missed it. Leaves WiFi in STA mode either way;
+// the caller tears it down.
+static bool connectToSavedNetwork() {
   WIFI_STORE.loadFromFile();
-  const std::string& ssid = WIFI_STORE.getLastConnectedSsid();
-  const WifiCredential* cred = ssid.empty() ? nullptr : WIFI_STORE.findCredential(ssid);
-  if (cred == nullptr) {
+  const auto& saved = WIFI_STORE.getCredentials();
+  if (saved.empty()) {
     LOG_DBG("SYNC", "No saved WiFi; skipping dashboard sync");
     return false;
   }
 
-  LOG_DBG("SYNC", "Dashboard sync: connecting to %s", cred->ssid.c_str());
   WiFi.persistent(false);  // creds owned by WifiCredentialStore; suppress SDK NVS
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true, true);
   delay(100);
-  if (cred->password.empty()) {
-    WiFi.begin(cred->ssid.c_str());
-  } else {
-    WiFi.begin(cred->ssid.c_str(), cred->password.c_str());
+
+  struct Candidate {
+    const WifiCredential* cred;
+    int32_t rssi;
+  };
+  constexpr int32_t RSSI_UNSEEN = -1000;  // sorts after any real reading
+  std::vector<Candidate> candidates;
+  candidates.reserve(saved.size());
+
+  const int16_t found = WiFi.scanNetworks();  // blocking, a few seconds
+  for (int16_t i = 0; i < found; i++) {
+    const WifiCredential* cred = WIFI_STORE.findCredential(WiFi.SSID(i).c_str());
+    if (cred == nullptr) continue;
+    const int32_t rssi = WiFi.RSSI(i);
+    auto it = std::find_if(candidates.begin(), candidates.end(), [cred](const Candidate& c) { return c.cred == cred; });
+    if (it == candidates.end()) {
+      candidates.push_back({cred, rssi});
+    } else if (rssi > it->rssi) {
+      it->rssi = rssi;  // same SSID on several APs: keep the strongest
+    }
+  }
+  WiFi.scanDelete();
+  std::sort(candidates.begin(), candidates.end(),
+            [](const Candidate& a, const Candidate& b) { return a.rssi > b.rssi; });
+
+  const std::string& lastSsid = WIFI_STORE.getLastConnectedSsid();
+  const WifiCredential* last = lastSsid.empty() ? nullptr : WIFI_STORE.findCredential(lastSsid);
+  if (last != nullptr &&
+      std::none_of(candidates.begin(), candidates.end(), [last](const Candidate& c) { return c.cred == last; })) {
+    candidates.push_back({last, RSSI_UNSEEN});
+  }
+  if (candidates.empty()) {
+    LOG_DBG("SYNC", "No saved WiFi in range; skipping dashboard sync");
+    return false;
   }
 
   constexpr unsigned long CONNECT_TIMEOUT_MS = 7000;
-  const unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < CONNECT_TIMEOUT_MS) {
-    if (WiFi.status() == WL_CONNECT_FAILED || WiFi.status() == WL_NO_SSID_AVAIL) break;
+  constexpr size_t MAX_ATTEMPTS = 3;  // bounds the worst case at ~21s of radio time
+  for (size_t n = 0; n < candidates.size() && n < MAX_ATTEMPTS; n++) {
+    const WifiCredential* cred = candidates[n].cred;
+    LOG_DBG("SYNC", "Dashboard sync: connecting to %s (rssi %ld)", cred->ssid.c_str(),
+            static_cast<long>(candidates[n].rssi));
+    if (cred->password.empty()) {
+      WiFi.begin(cred->ssid.c_str());
+    } else {
+      WiFi.begin(cred->ssid.c_str(), cred->password.c_str());
+    }
+    const unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < CONNECT_TIMEOUT_MS) {
+      if (WiFi.status() == WL_CONNECT_FAILED || WiFi.status() == WL_NO_SSID_AVAIL) break;
+      delay(100);
+    }
+    if (WiFi.status() == WL_CONNECTED) return true;
+    WiFi.disconnect(true, true);
     delay(100);
   }
+  LOG_DBG("SYNC", "WiFi connect timed out; skipping dashboard sync");
+  return false;
+}
 
+// ── Firmware self-update ─────────────────────────────────────────────────────
+// Dashboard refreshes are the one moment the reader is online with no activity
+// alive (largest possible heap), so they double as the update check. Rate
+// limited to roughly one GitHub query per FIRMWARE_CHECK_INTERVAL_MINUTES via a
+// refresh counter kept in RTC memory: it survives the deep sleeps between USB
+// timer wakes and the light sleeps of the battery loop, and the magic guards
+// the garbage a cold boot leaves there. After a successful install the reader
+// drops a marker file and restarts; setup() sees the marker and goes straight
+// back into the dashboard sleep loop instead of booting to the UI.
+namespace {
+constexpr char DASHBOARD_RESUME_MARKER[] = "/.crosspoint/dashboard_resume";
+constexpr uint32_t FIRMWARE_CHECK_INTERVAL_MINUTES = 6 * 60;
+constexpr uint32_t DASHBOARD_REFRESH_MAGIC = 0xDA5B0A2D;
+}  // namespace
+RTC_NOINIT_ATTR uint32_t dashboardRefreshMagic;
+RTC_NOINIT_ATTR uint32_t dashboardRefreshCount;
+
+// Pre-condition: WiFi is connected. Returns only when there is nothing to install.
+static void maybeSelfUpdate(uint32_t refreshMinutes) {
+  if (dashboardRefreshMagic != DASHBOARD_REFRESH_MAGIC) {
+    dashboardRefreshMagic = DASHBOARD_REFRESH_MAGIC;
+    dashboardRefreshCount = 0;
+  }
+  const uint32_t checkEvery =
+      std::max<uint32_t>(1, FIRMWARE_CHECK_INTERVAL_MINUTES / std::max<uint32_t>(1, refreshMinutes));
+  const bool due = (dashboardRefreshCount % checkEvery) == 0;
+  dashboardRefreshCount++;
+  if (!due) return;
+
+  OtaUpdater updater;
+  if (updater.checkForUpdate() != OtaUpdater::OK || !updater.isUpdateNewer()) {
+    LOG_DBG("OTA", "Auto-update: nothing newer than " CROSSPOINT_VERSION);
+    return;
+  }
+  LOG_INF("OTA", "Auto-update: installing %s", updater.getLatestVersion().c_str());
+  if (updater.installUpdate() != OtaUpdater::OK) {
+    LOG_ERR("OTA", "Auto-update failed; staying on " CROSSPOINT_VERSION);
+    return;
+  }
+  {
+    HalFile marker;
+    if (Storage.openFileForWrite("OTA", DASHBOARD_RESUME_MARKER, marker)) {
+      marker.write("1", 1);  // marker auto-closes at scope exit
+    }
+  }
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  ESP.restart();
+}
+
+// Returns true when a fresh image landed in /sleep.bmp so the caller can repaint with it.
+// allowSelfUpdate: also run the firmware update check while the network is up (see above).
+static bool syncSleepImageFromUrl(const DashboardConfig& dashboard, bool allowSelfUpdate) {
   bool updated = false;
-  if (WiFi.status() == WL_CONNECTED) {
+  if (connectToSavedNetwork()) {
     // Download to a temp path and swap on success, so a failed fetch keeps the
     // last good image (downloadToFile deletes its destination before writing).
-    const HttpDownloader::DownloadError r = HttpDownloader::downloadToFile(url, "/sleep.bmp.tmp");
+    const HttpDownloader::DownloadError r = HttpDownloader::downloadToFile(dashboard.url, "/sleep.bmp.tmp");
     if (r == HttpDownloader::OK) {
       if (Storage.exists("/sleep.bmp")) Storage.remove("/sleep.bmp");
       updated = Storage.rename("/sleep.bmp.tmp", "/sleep.bmp");
-      LOG_DBG("SYNC", "Sleep image updated from %s", url.c_str());
+      LOG_DBG("SYNC", "Sleep image updated from %s", dashboard.url.c_str());
     } else {
       LOG_DBG("SYNC", "Dashboard download failed (err %d)", static_cast<int>(r));
     }
-  } else {
-    LOG_DBG("SYNC", "WiFi connect timed out; skipping dashboard sync");
+    if (allowSelfUpdate) {
+      maybeSelfUpdate(dashboard.refreshMinutes);  // restarts on success
+    }
   }
 
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
   return updated;
+}
+
+// Battery-powered dashboard refresh loop. Deep sleep on battery powers the MCU
+// off, so instead stay in light sleep (RAM and the battery latch intact) and
+// repeat fetch + repaint in place. Entered with WiFi off and the panel and tilt
+// sensor already asleep. Never returns: a power-button wake restarts the chip so
+// the regular boot path (splash, home/reader resume) runs exactly as it would
+// after a deep-sleep wake. Costs the light-sleep idle draw of the whole board
+// for as long as the reader sleeps, so it is opt-in via "battery" in the file.
+[[noreturn]] static void runBatteryDashboardLoop(const DashboardConfig& dashboard, uint64_t refreshUs) {
+  LOG_DBG("SYNC", "Battery dashboard loop: refresh every %lu min",
+          static_cast<unsigned long>(dashboard.refreshMinutes));
+  for (;;) {
+    if (powerManager.lightSleep(gpio, refreshUs) == HalPowerManager::LightSleepWake::PowerButton) {
+      LOG_DBG("SYNC", "Power button during battery dashboard loop; restarting");
+      ESP.restart();
+    }
+    // Timer wake. The panel is in its own deep sleep, which only a hardware reset
+    // leaves; begin() does that without touching the image it is holding.
+    display.begin(/*seamless=*/true);
+    if (syncSleepImageFromUrl(dashboard, /*allowSelfUpdate=*/true)) {
+      activityManager.goToSleep(/*fromTimeout=*/false);  // repaint with the fresh image
+    }
+    if (WiFi.getMode() != WIFI_MODE_NULL) {
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF);
+    }
+    display.deepSleep();
+    if (gpio.isUsbConnected()) {
+      // Plugged in meanwhile: the deep-sleep timer path is cheaper, hand over to it.
+      powerManager.startDeepSleep(gpio, refreshUs);
+    }
+  }
 }
 
 // Enter deep sleep mode.
@@ -395,7 +544,9 @@ void enterDeepSleep(bool fromTimeout = false, bool dashboardRefresh = false) {
     // delay sleep and drain the battery).
     saveSleepFrameBuffer();
   } else if (hasDashboard) {
-    const bool updated = syncSleepImageFromUrl(dashboard.url);
+    // Self-update only on refresh boots: a user-initiated sleep should not
+    // stall for a firmware download.
+    const bool updated = syncSleepImageFromUrl(dashboard, /*allowSelfUpdate=*/dashboardRefresh);
     // A fresh dashboard landed in /sleep.bmp: repaint so this sleep shows it
     // (the paint above showed the previous image while WiFi was up). A refresh
     // boot has not painted yet, so it paints here even with the last good image.
@@ -415,11 +566,20 @@ void enterDeepSleep(bool fromTimeout = false, bool dashboardRefresh = false) {
   display.deepSleep();
   LOG_DBG("MAIN", "Entering deep sleep");
 
-  // Periodic dashboard refresh: arm an RTC timer wake so the next boot re-fetches
-  // the image. Only armed on USB power, where the MCU stays alive through sleep.
+  const bool periodicRefresh = hasDashboard && !isQuickResumeSleep && dashboard.refreshMinutes > 0;
+  const uint64_t refreshUs = static_cast<uint64_t>(dashboard.refreshMinutes) * 60ULL * 1000000ULL;
+
+  if (periodicRefresh && !gpio.isUsbConnected() && dashboard.refreshOnBattery) {
+    runBatteryDashboardLoop(dashboard, refreshUs);  // does not return
+  }
+
+  // Periodic dashboard refresh on USB: arm an RTC timer wake so the next boot
+  // re-fetches the image. Only useful on USB power, where the MCU stays alive
+  // through deep sleep; on battery (without "battery" above) the refresh
+  // happens at the next sleep entry instead.
   uint64_t timerWakeupUs = 0;
-  if (hasDashboard && !isQuickResumeSleep && dashboard.refreshMinutes > 0 && gpio.isUsbConnected()) {
-    timerWakeupUs = static_cast<uint64_t>(dashboard.refreshMinutes) * 60ULL * 1000000ULL;
+  if (periodicRefresh && gpio.isUsbConnected()) {
+    timerWakeupUs = refreshUs;
     LOG_DBG("SYNC", "Dashboard refresh armed: %lu min", static_cast<unsigned long>(dashboard.refreshMinutes));
   }
   powerManager.startDeepSleep(gpio, timerWakeupUs);
@@ -534,6 +694,18 @@ void setup() {
     case HalGPIO::WakeupReason::Other:
     default:
       break;
+  }
+
+  // Reboot after a firmware self-update (see maybeSelfUpdate): resume the
+  // dashboard sleep loop instead of booting to the UI. The marker is consumed
+  // on any boot so a stale one can never hijack a later power-button wake.
+  if (Storage.exists(DASHBOARD_RESUME_MARKER)) {
+    Storage.remove(DASHBOARD_RESUME_MARKER);
+    if (wakeupReason != HalGPIO::WakeupReason::PowerButton) {
+      LOG_INF("MAIN", "Resuming dashboard after firmware update (now " CROSSPOINT_VERSION ")");
+      setupDisplayAndFonts(/*seamless=*/true);
+      enterDeepSleep(/*fromTimeout=*/false, /*dashboardRefresh=*/true);  // does not return
+    }
   }
 
   // Recovery firmware mode: hold left side button (BTN_UP) together with the power button at

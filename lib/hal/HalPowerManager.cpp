@@ -2,6 +2,7 @@
 
 #include <Logging.h>
 #include <WiFi.h>
+#include <driver/gpio.h>
 #include <esp_sleep.h>
 
 #include <cassert>
@@ -96,6 +97,29 @@ void HalPowerManager::startDeepSleep(HalGPIO& gpio, uint64_t timerWakeupUs) cons
   }
   // Enter Deep Sleep
   esp_deep_sleep_start();
+}
+
+HalPowerManager::LightSleepWake HalPowerManager::lightSleep(HalGPIO& gpio, uint64_t timerWakeupUs) const {
+  // Same release guard as deep sleep: a held button would otherwise wake us immediately.
+  while (gpio.isPressed(HalGPIO::BTN_POWER)) {
+    delay(50);
+    gpio.update();
+  }
+
+  // Light-sleep GPIO wake needs the pin armed via the GPIO driver (the deep-sleep
+  // variant used by startDeepSleep() does not apply here). The button pulls LOW.
+  constexpr auto powerPin = static_cast<gpio_num_t>(InputManager::POWER_BUTTON_PIN);
+  gpio_wakeup_enable(powerPin, GPIO_INTR_LOW_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
+  esp_sleep_enable_timer_wakeup(timerWakeupUs);
+
+  esp_light_sleep_start();
+
+  const esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+  // Disarm so a later deep sleep only carries the sources startDeepSleep() sets.
+  gpio_wakeup_disable(powerPin);
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+  return cause == ESP_SLEEP_WAKEUP_GPIO ? LightSleepWake::PowerButton : LightSleepWake::Timer;
 }
 
 uint16_t HalPowerManager::getBatteryPercentage() const {
