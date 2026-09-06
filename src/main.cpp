@@ -320,6 +320,22 @@ static bool readDashboardConfig(DashboardConfig& out) {
   return true;
 }
 
+// Result of the most recent sync, overwritten every time, so a failure can be
+// read from a phone via the web File Manager instead of needing a serial cable.
+static void writeDashboardStatus(const char* result, const char* detail) {
+  static char buf[256];  // static: keeps the sleep-entry stack small
+  const int n = snprintf(buf, sizeof(buf), "firmware: %s\nresult: %s\ndetail: %s\nnetwork: %s\nuptime_s: %lu\n",
+                         CROSSPOINT_VERSION, result, detail, WiFi.isConnected() ? WiFi.SSID().c_str() : "-",
+                         static_cast<unsigned long>(millis() / 1000));
+  if (n <= 0) return;
+  constexpr char STATUS_PATH[] = "/dashboard.status";
+  if (Storage.exists(STATUS_PATH)) Storage.remove(STATUS_PATH);  // never leave a stale tail
+  HalFile f;
+  if (Storage.openFileForWrite("SYNC", STATUS_PATH, f)) {
+    f.write(buf, static_cast<size_t>(n));  // auto-closes at scope exit
+  }
+}
+
 // Join the best saved network in range: scan, rank saved SSIDs by signal, and
 // try them strongest-first. An idle phone hotspot stops beaconing and will not
 // show up in a scan, so the last connected network is always tried as a final
@@ -330,6 +346,7 @@ static bool connectToSavedNetwork() {
   const auto& saved = WIFI_STORE.getCredentials();
   if (saved.empty()) {
     LOG_DBG("SYNC", "No saved WiFi; skipping dashboard sync");
+    writeDashboardStatus("wifi-failed", "no saved networks");
     return false;
   }
 
@@ -370,6 +387,7 @@ static bool connectToSavedNetwork() {
   }
   if (candidates.empty()) {
     LOG_DBG("SYNC", "No saved WiFi in range; skipping dashboard sync");
+    writeDashboardStatus("wifi-failed", "no saved network in range");
     return false;
   }
 
@@ -394,6 +412,7 @@ static bool connectToSavedNetwork() {
     delay(100);
   }
   LOG_DBG("SYNC", "WiFi connect timed out; skipping dashboard sync");
+  writeDashboardStatus("wifi-failed", "connect timed out");
   return false;
 }
 
@@ -434,8 +453,10 @@ static void maybeSelfUpdate(uint32_t refreshMinutes) {
   LOG_INF("OTA", "Auto-update: installing %s", updater.getLatestVersion().c_str());
   if (updater.installUpdate() != OtaUpdater::OK) {
     LOG_ERR("OTA", "Auto-update failed; staying on " CROSSPOINT_VERSION);
+    writeDashboardStatus("update-failed", updater.getLatestVersion().c_str());
     return;
   }
+  writeDashboardStatus("update-installed", updater.getLatestVersion().c_str());
   {
     HalFile marker;
     if (Storage.openFileForWrite("OTA", DASHBOARD_RESUME_MARKER, marker)) {
@@ -459,8 +480,12 @@ static bool syncSleepImageFromUrl(const DashboardConfig& dashboard, bool allowSe
       if (Storage.exists("/sleep.bmp")) Storage.remove("/sleep.bmp");
       updated = Storage.rename("/sleep.bmp.tmp", "/sleep.bmp");
       LOG_DBG("SYNC", "Sleep image updated from %s", dashboard.url.c_str());
+      writeDashboardStatus(updated ? "ok" : "rename-failed", dashboard.url.c_str());
     } else {
       LOG_DBG("SYNC", "Dashboard download failed (err %d)", static_cast<int>(r));
+      char detail[48];
+      snprintf(detail, sizeof(detail), "download error %d", static_cast<int>(r));
+      writeDashboardStatus("download-failed", detail);
     }
     if (allowSelfUpdate) {
       maybeSelfUpdate(dashboard.refreshMinutes);  // restarts on success

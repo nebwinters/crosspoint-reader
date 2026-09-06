@@ -53,8 +53,31 @@ temporary file and is swapped in only on success.
 
 ## Troubleshooting
 
+After every sync the reader overwrites `dashboard.status` in the SD root with
+the outcome, so you can diagnose from a phone via the web File Manager:
+
+```text
+firmware: 1.3.0-dev-master-abc1234
+result: download-failed
+detail: download error 1
+network: HomeWifi
+uptime_s: 14
+```
+
+| result | meaning |
+|--------|---------|
+| `ok` | Image fetched and swapped into `sleep.bmp`. `detail` is the URL. |
+| `wifi-failed` | No saved network, none in range, or the join timed out (`detail` says which). |
+| `download-failed` | Joined Wi-Fi but the fetch failed. Error 1 = HTTP/TLS, 2 = SD write, 3 = aborted. |
+| `rename-failed` | Downloaded, but the SD swap into `sleep.bmp` failed. |
+| `update-installed` | A newer fork release was flashed; `detail` is its version. Next boot resumes the dashboard. |
+| `update-failed` | The release download or flash failed; the current firmware stays. |
+
+A failed sync keeps the previous `sleep.bmp`, so "the image didn't change" and
+"the sync failed" look the same on screen. The status file tells them apart.
+
 The default "CrossPoint SLEEPING" screen means no usable image is on the card.
-Failures are logged over serial only, so check in this order:
+If there is no status file at all, the sync never ran, so check in this order:
 
 1. The reader is running a build that includes this feature (the version on
    the web Home page ends in a branch name and commit hash).
