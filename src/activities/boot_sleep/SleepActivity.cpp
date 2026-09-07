@@ -37,6 +37,13 @@ void SleepActivity::onEnter() {
     GUI.drawPopup(renderer, tr(STR_ENTERING_SLEEP));
   }
 
+  // Dashboard auto-sync (see main.cpp): the marker file's presence opts this
+  // device into showing the synced /sleep.bmp. Quick-resume sleeps returned
+  // above — the user's saved session frame always wins over the dashboard.
+  if (Storage.exists(DASHBOARD_URL_FILE)) {
+    return renderCustomSleepScreen();
+  }
+
   switch (SETTINGS.sleepScreen) {
     case (CrossPointSettings::SLEEP_SCREEN_MODE::BLANK):
       return renderBlankSleepScreen();

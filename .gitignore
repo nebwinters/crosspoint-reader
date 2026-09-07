@@ -23,3 +23,8 @@ lib/EpdFont/scripts/output/
 # (worktrees, scheduled-task locks, settings.local, scout CLEANUP.md) out.
 .claude/*
 !.claude/skills/
+
+# Firmware binaries belong in CI artifacts and releases, never in git
+ci/
+*.bin
+!lib/**/*.bin

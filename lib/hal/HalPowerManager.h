@@ -39,7 +39,15 @@ class HalPowerManager {
 
   // Setup wake up GPIO and enter deep sleep
   // Should be called inside main loop() to handle the currentLockMode
-  void startDeepSleep(HalGPIO& gpio) const;
+  // timerWakeupUs > 0 additionally arms an RTC timer wake after that many microseconds. This only takes effect on USB
+  // power: on battery the latch MOSFET powers the MCU off entirely during sleep, so the timer never runs.
+  void startDeepSleep(HalGPIO& gpio, uint64_t timerWakeupUs = 0) const;
+
+  // Light sleep keeps the MCU powered (RAM, peripherals, and the battery latch untouched) and returns when either the
+  // power button is pressed or timerWakeupUs elapses. Unlike deep sleep this works on battery, at the cost of the
+  // light-sleep idle draw. Callers must have torn down WiFi first.
+  enum class LightSleepWake { PowerButton, Timer };
+  LightSleepWake lightSleep(HalGPIO& gpio, uint64_t timerWakeupUs) const;
 
   // Get battery percentage (range 0-100)
   uint16_t getBatteryPercentage() const;

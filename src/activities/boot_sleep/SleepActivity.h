@@ -1,6 +1,12 @@
 #pragma once
 #include "activities/Activity.h"
 
+// Dashboard auto-sync marker on the SD root: holds the URL that enterDeepSleep()
+// downloads into /sleep.bmp (see main.cpp). Its presence also makes SleepActivity
+// render /sleep.bmp for non-quick-resume sleeps, without rewriting the user's
+// configured sleep screen mode.
+inline constexpr char DASHBOARD_URL_FILE[] = "/dashboard.url";
+
 class Bitmap;
 
 class SleepActivity final : public Activity {
