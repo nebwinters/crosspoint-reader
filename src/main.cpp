@@ -324,9 +324,11 @@ static bool readDashboardConfig(DashboardConfig& out) {
 // read from a phone via the web File Manager instead of needing a serial cable.
 static void writeDashboardStatus(const char* result, const char* detail) {
   static char buf[256];  // static: keeps the sleep-entry stack small
-  const int n = snprintf(buf, sizeof(buf), "firmware: %s\nresult: %s\ndetail: %s\nnetwork: %s\nuptime_s: %lu\n",
-                         CROSSPOINT_VERSION, result, detail, WiFi.isConnected() ? WiFi.SSID().c_str() : "-",
-                         static_cast<unsigned long>(millis() / 1000));
+  const int n =
+      snprintf(buf, sizeof(buf), "firmware: %s\nresult: %s\ndetail: %s\nnetwork: %s\nuptime_s: %lu\nbattery_pct: %u\nusb: %s\n",
+               CROSSPOINT_VERSION, result, detail, WiFi.isConnected() ? WiFi.SSID().c_str() : "-",
+               static_cast<unsigned long>(millis() / 1000),
+               static_cast<unsigned>(powerManager.getBatteryPercentage()), gpio.isUsbConnected() ? "yes" : "no");
   if (n <= 0) return;
   constexpr char STATUS_PATH[] = "/dashboard.status";
   if (Storage.exists(STATUS_PATH)) Storage.remove(STATUS_PATH);  // never leave a stale tail
@@ -722,11 +724,22 @@ void setup() {
       gpio.verifyPowerButtonWakeup(SETTINGS.getPowerButtonDuration(),
                                    SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::SLEEP);
       break;
-    case HalGPIO::WakeupReason::AfterUSBPower:
-      // If USB power caused a cold boot, go back to sleep
+    case HalGPIO::WakeupReason::AfterUSBPower: {
+      // If USB power caused a cold boot, go back to sleep -- but re-arm the
+      // dashboard refresh timer first. Sleeping with no timer here meant that
+      // plugging the reader in silently ended the periodic refresh until the
+      // next hand-driven sleep, which is the opposite of what plugging in should do.
       LOG_DBG("MAIN", "Wakeup reason: After USB Power");
-      powerManager.startDeepSleep(gpio);
+      DashboardConfig dashboard;
+      uint64_t timerWakeupUs = 0;
+      if (readDashboardConfig(dashboard) && dashboard.refreshMinutes > 0) {
+        timerWakeupUs = static_cast<uint64_t>(dashboard.refreshMinutes) * 60ULL * 1000000ULL;
+        LOG_DBG("SYNC", "Dashboard refresh re-armed on USB power: %lu min",
+                static_cast<unsigned long>(dashboard.refreshMinutes));
+      }
+      powerManager.startDeepSleep(gpio, timerWakeupUs);
       break;
+    }
     case HalGPIO::WakeupReason::Timer:
       // USB-powered dashboard refresh: bring up the display without the splash,
       // re-fetch and re-render the sleep image, then sleep again with the timer

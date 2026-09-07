@@ -4,6 +4,7 @@
 #include <WiFi.h>
 #include <driver/gpio.h>
 #include <esp_sleep.h>
+#include <esp_timer.h>
 
 #include <cassert>
 
@@ -107,19 +108,52 @@ HalPowerManager::LightSleepWake HalPowerManager::lightSleep(HalGPIO& gpio, uint6
   }
 
   // Light-sleep GPIO wake needs the pin armed via the GPIO driver (the deep-sleep
-  // variant used by startDeepSleep() does not apply here). The button pulls LOW.
+  // variant used by startDeepSleep() does not apply here). The button pulls LOW,
+  // so the pin must be held HIGH by its pull-up before the LOW-level trigger is
+  // armed -- startDeepSleep() sets this and the light-sleep path needs it too.
+  // Without it the trigger fires the instant we sleep and the battery dashboard
+  // loop restarts the reader instead of refreshing.
   constexpr auto powerPin = static_cast<gpio_num_t>(InputManager::POWER_BUTTON_PIN);
+  pinMode(InputManager::POWER_BUTTON_PIN, INPUT_PULLUP);
   gpio_wakeup_enable(powerPin, GPIO_INTR_LOW_LEVEL);
   esp_sleep_enable_gpio_wakeup();
-  esp_sleep_enable_timer_wakeup(timerWakeupUs);
 
-  esp_light_sleep_start();
+  // A GPIO wake that is not a real press (line noise, a wake racing the pull-up)
+  // must neither restart the reader nor burn a refresh: confirm the button is
+  // still down after a short debounce, otherwise sleep out the remaining time.
+  constexpr int64_t PRESS_DEBOUNCE_US = 40000;
+  const int64_t deadlineUs = esp_timer_get_time() + static_cast<int64_t>(timerWakeupUs);
+  LightSleepWake result = LightSleepWake::Timer;
+  for (;;) {
+    const int64_t remainingUs = deadlineUs - esp_timer_get_time();
+    if (remainingUs <= 0) break;  // timer expired while we were debouncing
+    esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(remainingUs));
 
-  const esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    esp_light_sleep_start();
+
+    if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_GPIO) break;  // timer wake
+
+    bool held = true;
+    const int64_t debounceEnd = esp_timer_get_time() + PRESS_DEBOUNCE_US;
+    while (esp_timer_get_time() < debounceEnd) {
+      gpio.update();
+      if (!gpio.isPressed(HalGPIO::BTN_POWER)) {
+        held = false;
+        break;
+      }
+      delay(5);
+    }
+    if (held) {
+      result = LightSleepWake::PowerButton;
+      break;
+    }
+    LOG_DBG("PWR", "Spurious GPIO wake in light sleep; resuming");
+  }
+
   // Disarm so a later deep sleep only carries the sources startDeepSleep() sets.
   gpio_wakeup_disable(powerPin);
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
-  return cause == ESP_SLEEP_WAKEUP_GPIO ? LightSleepWake::PowerButton : LightSleepWake::Timer;
+  return result;
 }
 
 uint16_t HalPowerManager::getBatteryPercentage() const {
