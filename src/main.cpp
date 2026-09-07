@@ -324,11 +324,11 @@ static bool readDashboardConfig(DashboardConfig& out) {
 // read from a phone via the web File Manager instead of needing a serial cable.
 static void writeDashboardStatus(const char* result, const char* detail) {
   static char buf[256];  // static: keeps the sleep-entry stack small
-  const int n =
-      snprintf(buf, sizeof(buf), "firmware: %s\nresult: %s\ndetail: %s\nnetwork: %s\nuptime_s: %lu\nbattery_pct: %u\nusb: %s\n",
-               CROSSPOINT_VERSION, result, detail, WiFi.isConnected() ? WiFi.SSID().c_str() : "-",
-               static_cast<unsigned long>(millis() / 1000),
-               static_cast<unsigned>(powerManager.getBatteryPercentage()), gpio.isUsbConnected() ? "yes" : "no");
+  const int n = snprintf(
+      buf, sizeof(buf), "firmware: %s\nresult: %s\ndetail: %s\nnetwork: %s\nuptime_s: %lu\nbattery_pct: %u\nusb: %s\n",
+      CROSSPOINT_VERSION, result, detail, WiFi.isConnected() ? WiFi.SSID().c_str() : "-",
+      static_cast<unsigned long>(millis() / 1000), static_cast<unsigned>(powerManager.getBatteryPercentage()),
+      gpio.isUsbConnected() ? "yes" : "no");
   if (n <= 0) return;
   constexpr char STATUS_PATH[] = "/dashboard.status";
   if (Storage.exists(STATUS_PATH)) Storage.remove(STATUS_PATH);  // never leave a stale tail
